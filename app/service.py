@@ -145,9 +145,13 @@ async def wait_for_settle(
 
     主通道为 Pub/Sub：先订阅，再检查一次状态（消除“先检查后订阅”的丢消息窗口）；
     轮询作为兜底，覆盖发布丢失 / 截止时间到达（截止不发布消息）两种情况。
-    多个等待者各自订阅同一频道，达标（reached）或取消（cancelled）发布时全部被唤醒。
+    多个等待者各自订阅同一频道，达标（reached）、取消（cancelled）或运行中
+    延期（deadline_extended）发布时全部被唤醒。
+
+    延期不会产生终态，只改变截止时间：被 deadline_extended 唤醒（或任何轮询
+    回读）后都会重新读取元数据，按最新 deadline 继续等待，绝不能按进入请求时
+    的旧截止时间误报 expired。
     """
-    deadline_d = meta.deadline
 
     # 已经有结果则立即返回（达标、取消快照或截止结果）
     first = await build_view(store, meta)
@@ -157,13 +161,22 @@ async def wait_for_settle(
     pubsub = store.redis.pubsub()
     await pubsub.subscribe(store.channel(meta.barrier_id))
     try:
-        # 订阅成功后再次检查：终态发布可能发生在第一次检查与订阅之间
+        # 订阅成功后再次检查：终态发布可能发生在第一次检查与订阅之间；
+        # 同时重读元数据，延期可能恰好发生在首次检查与订阅之间。
+        meta = (await store.get_meta(meta.barrier_id)) or meta
         second = await build_view(store, meta)
         if second.status in SETTLED_STATUSES:
             return second
 
         start = time.time()
         while True:
+            # 每轮回读元数据：deadline 可能已被其他请求延期；
+            # 必须以 Redis 中的最新生效值计算剩余等待与 expired 判定。
+            fresh_meta = await store.get_meta(meta.barrier_id)
+            if fresh_meta is not None:
+                meta = fresh_meta
+            deadline_d = meta.deadline
+
             now = time.time()
             remaining_budget = max_wait_s - (now - start)
             if remaining_budget <= 0:
@@ -181,7 +194,8 @@ async def wait_for_settle(
                 )
 
             # 无论被消息唤醒还是轮询到期，都回读真实状态：
-            # 达标 / 取消则立即返回终态快照；到达截止则返回报到与缺席名单。
+            # 达标 / 取消则立即返回终态快照；到达最新截止则返回报到与缺席名单；
+            # 仅被延期则继续下一轮，按新 deadline 等待。
             view = await build_view(store, meta)
             if view.status in SETTLED_STATUSES:
                 return view

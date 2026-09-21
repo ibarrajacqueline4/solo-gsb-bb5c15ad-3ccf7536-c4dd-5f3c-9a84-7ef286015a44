@@ -194,6 +194,22 @@ class CancelRequest(BaseModel):
         return self
 
 
+class ExtendDeadlineRequest(BaseModel):
+    deadline: datetime = Field(
+        ...,
+        description=(
+            "新的绝对截止时间，ISO-8601；不带时区偏移时按 UTC 处理。"
+            "必须严格晚于当前生效的 deadline"
+        ),
+    )
+
+    def deadline_ts(self) -> float:
+        d = self.deadline
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc).timestamp()
+
+
 class CancelResponse(BaseModel):
     barrier_id: str
     status: str = Field(

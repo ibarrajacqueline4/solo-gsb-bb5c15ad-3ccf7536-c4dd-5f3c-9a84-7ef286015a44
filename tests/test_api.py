@@ -62,6 +62,12 @@ async def cancel(client: AsyncClient, bid: str, reason: str):
     return await client.post(f"/barriers/{bid}/cancel", json={"reason": reason})
 
 
+async def extend(client: AsyncClient, bid: str, deadline):
+    if isinstance(deadline, datetime):
+        deadline = deadline.isoformat()
+    return await client.patch(f"/barriers/{bid}/deadline", json={"deadline": deadline})
+
+
 @pytest.mark.asyncio
 async def test_health_and_root():
     async with await _client() as c:
@@ -597,6 +603,438 @@ async def test_cancel_and_trigger_checkin_race_exactly_one_terminal_state():
             winners.append(status)
 
         assert set(winners) == {"reached", "cancelled"}, Counter(winners)
+
+
+# ---------------------------------------------------------------------------
+# 运行中延期（PATCH /barriers/{id}/deadline）
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.asyncio
+async def test_extend_updates_deadline_and_returns_full_view():
+    """waiting 屏障延期到更晚时间：200，返回完整 waiting 视图，deadline 已更新；
+    报到名单/进度等其他字段保持不变；延期本身不产生报到事件。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=2)
+        bid = b["barrier_id"]
+        old_deadline = b["deadline"]
+        await checkin(c, bid, "a")
+
+        new_deadline = datetime.now(timezone.utc) + timedelta(seconds=20)
+        r = await extend(c, bid, new_deadline)
+        assert r.status_code == 200, r.text
+        view = r.json()
+        assert view["status"] == "waiting"
+        assert view["barrier_id"] == bid
+        # 响应里的 deadline 与新请求一致（毫秒精度序列化）
+        assert datetime.fromisoformat(view["deadline"]) >= new_deadline - timedelta(
+            milliseconds=2
+        )
+        assert datetime.fromisoformat(view["deadline"]) > datetime.fromisoformat(
+            old_deadline
+        )
+        # 完整视图：名单、达标人数、已有报到均保留
+        assert view["participants"] == ["a", "b", "c"]
+        assert view["threshold"] == 3
+        assert view["checked_in"] == ["a"]
+        assert view["checked_count"] == 1
+        assert view["quorum"] is None and view["missing"] is None
+
+        # GET 读到的也是新 deadline
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["deadline"] == view["deadline"]
+
+        # 延期不是报到行为，不产生审计事件
+        events = (await get_events(c, bid)).json()["events"]
+        assert [e["result"] for e in events] == ["checked_in"]
+
+
+@pytest.mark.asyncio
+async def test_extend_same_or_earlier_deadline_conflicts_409():
+    """相同或更早的截止时间返回 409，deadline 不被改写；不存在的屏障 404。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+        original = datetime.fromisoformat(b["deadline"])
+
+        # 相同时间（完全一致）→ 409
+        r = await extend(c, bid, original)
+        assert r.status_code == 409, r.text
+
+        # 更早时间 → 409
+        r = await extend(c, bid, original - timedelta(seconds=5))
+        assert r.status_code == 409
+
+        # 成功延期到 +20s 后，再用 +10s（早于新生效值）→ 409
+        assert (
+            await extend(c, bid, original + timedelta(seconds=20))
+        ).status_code == 200
+        r = await extend(c, bid, original + timedelta(seconds=10))
+        assert r.status_code == 409
+        # 相同于新生效值 → 409
+        r = await extend(c, bid, original + timedelta(seconds=20))
+        assert r.status_code == 409
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert datetime.fromisoformat(g["deadline"]) >= original + timedelta(
+            seconds=20
+        ) - timedelta(milliseconds=2)
+
+        # 不存在 / 已回收 → 404
+        assert (
+            await extend(c, "deadbeefdeadbeef", datetime(2030, 1, 1, tzinfo=timezone.utc))
+        ).status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_extend_refuses_terminal_states_without_revival():
+    """reached / cancelled / expired 终态延期一律 409，终态视图与数据不变。"""
+    async with await _client() as c:
+        far_future = datetime.now(timezone.utc) + timedelta(seconds=60)
+
+        # reached
+        b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=10)
+        bid = b["barrier_id"]
+        cr = await checkin(c, bid, "a")
+        assert cr.json()["status"] == "reached"
+        frozen_at = cr.json()["frozen_at"]
+        r = await extend(c, bid, far_future)
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "reached"
+        assert g["frozen_at"] == frozen_at
+
+        # cancelled
+        b = await create_barrier(c, ["x", "y"], threshold=2, ttl_s=10)
+        bid = b["barrier_id"]
+        await cancel(c, bid, "停")
+        r = await extend(c, bid, far_future)
+        assert r.status_code == 409
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "cancelled"
+        assert g["cancel_reason"] == "停"
+
+        # expired：等到截止后延期，必须 409 且不能复活成 waiting
+        b = await create_barrier(c, ["p", "q"], threshold=2, ttl_s=1)
+        bid = b["barrier_id"]
+        await asyncio.sleep(1.2)
+        g = (await c.get(f"/barriers/{bid}")).json()
+        assert g["status"] == "expired"
+        r = await extend(c, bid, far_future)
+        assert r.status_code == 409
+        g2 = (await c.get(f"/barriers/{bid}")).json()
+        assert g2["status"] == "expired"
+        assert g2["missing"] == ["p", "q"]
+        # 截止后报到依旧被拒绝（延期没有复活屏障）
+        assert (await checkin(c, bid, "p")).status_code == 409
+
+
+@pytest.mark.asyncio
+async def test_concurrent_extensions_redis_order_wins():
+    """多个并发延期以 Redis 实际生效顺序为准：结果顺序可任意，但满足不变量——
+    成功者构成一条严格递增链（每个成功者在其执行时刻都严格大于当时生效值），
+    链尾必为所有请求中的最大值且只出现一次；其余请求全部 409，最终生效值
+    必为最大值。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=2)
+        bid = b["barrier_id"]
+        base = datetime.fromisoformat(b["deadline"])
+
+        deltas = [60, 40, 80, 60, 80, 20, 80]  # 含相同最大值 80 三次、60 两次
+        reqs = [
+            extend(c, bid, base + timedelta(seconds=d))
+            for d in deltas
+        ]
+        results = await asyncio.gather(*reqs)
+        statuses = [r.status_code for r in results]
+
+        max_delta = max(deltas)
+        winner_deltas = sorted(
+            d for d, r in zip(deltas, results) if r.status_code == 200
+        )
+        # 成功者严格递增、链尾为全局最大值；相同时间的重复副本只能成功一次
+        assert winner_deltas == sorted(set(winner_deltas))
+        assert winner_deltas[-1] == max_delta
+        assert len([d for d in winner_deltas if d == max_delta]) == 1
+        # 其余请求全部冲突
+        assert sum(1 for s in statuses if s == 409) == len(deltas) - len(winner_deltas)
+        for r in results:
+            if r.status_code == 200:
+                assert r.json()["status"] == "waiting"
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        final = datetime.fromisoformat(g["deadline"])
+        assert final >= base + timedelta(seconds=max_delta) - timedelta(
+            milliseconds=2
+        )
+        assert final < base + timedelta(seconds=max_delta + 1)
+
+
+@pytest.mark.asyncio
+async def test_concurrent_extensions_deterministic_redis_execution_order():
+    """同一事务内固定入队顺序执行多个延期脚本：严格递增者成功，较早 / 相同值
+    按脚本执行时刻的当前生效值判定冲突。"""
+    from app.barrier_store import EXTEND_SCRIPT
+    from app.main import app
+
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=2)
+        bid = b["barrier_id"]
+        base = datetime.fromisoformat(b["deadline"])
+        keys = [
+            f"barrier:{bid}",
+            f"barrier:{bid}:roster",
+            f"barrier:{bid}:checked",
+            f"barrier:{bid}:frozen",
+            f"barrier:{bid}:events",
+            f"barrier:{bid}:cancel",
+            f"barrier:{bid}:gmap",
+            f"barrier:{bid}:gcheck",
+        ]
+        now = f"{time.time():.3f}"
+
+        async def run(deltas):
+            pipe = app.state.store.redis.pipeline(transaction=True)
+            for d in deltas:
+                ts = f"{(base + timedelta(seconds=d)).timestamp():.3f}"
+                pipe.eval(
+                    EXTEND_SCRIPT, 8, *keys, ts, now, str(24 * 3600 * 1000)
+                )
+            return await pipe.execute()
+
+        # 固定顺序 80 -> 60 -> 100 -> 100：成功、冲突、成功、冲突（相同值）
+        raws = await run([80, 60, 100, 100])
+        assert [row[0] for row in raws] == [
+            "extended",
+            "conflict",
+            "extended",
+            "conflict",
+        ]
+        # 冲突响应带当时生效值（毫秒精度的小浮点误差内）
+        assert abs(float(raws[1][1]) - (base + timedelta(seconds=80)).timestamp()) < 0.01
+        assert abs(float(raws[3][1]) - (base + timedelta(seconds=100)).timestamp()) < 0.01
+
+        g = (await c.get(f"/barriers/{bid}")).json()
+        final = datetime.fromisoformat(g["deadline"])
+        assert abs(final - (base + timedelta(seconds=100))) < timedelta(milliseconds=2)
+
+        # 另一个屏障验证乱序：20 -> 80 -> 40 -> 60
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=2)
+        bid = b["barrier_id"]
+        base = datetime.fromisoformat(b["deadline"])
+        keys = [
+            f"barrier:{bid}{s}"
+            for s in ("", ":roster", ":checked", ":frozen", ":events",
+                      ":cancel", ":gmap", ":gcheck")
+        ]
+        pipe = app.state.store.redis.pipeline(transaction=True)
+        for d in [20, 80, 40, 60]:
+            ts = f"{(base + timedelta(seconds=d)).timestamp():.3f}"
+            pipe.eval(EXTEND_SCRIPT, 8, *keys, ts, now, str(24 * 3600 * 1000))
+        raws = await pipe.execute()
+        assert [row[0] for row in raws] == [
+            "extended",
+            "extended",
+            "conflict",
+            "conflict",
+        ]
+
+
+@pytest.mark.asyncio
+async def test_waiter_rereads_extended_deadline_no_false_expired():
+    """已挂起的 /wait 收到延期通知后立即重读最新 deadline 继续等待：
+    旧截止点已过也不得误报 expired；直到新截止才返回 expired。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=1)
+        bid = b["barrier_id"]
+        old_deadline = datetime.fromisoformat(b["deadline"])
+
+        async def wait_view():
+            async with await _client() as c2:
+                started = time.time()
+                r = await c2.get(f"/barriers/{bid}/wait")
+                return time.time() - started, r
+
+        waiter = asyncio.create_task(wait_view())
+        await asyncio.sleep(0.3)  # 等待者已订阅
+
+        # 在旧截止前延期 4 秒：旧截止点（~0.7s 后）不应触发 expired
+        new_deadline = datetime.now(timezone.utc) + timedelta(seconds=4)
+        r = await extend(c, bid, new_deadline)
+        assert r.status_code == 200
+        new_deadline_abs = datetime.fromisoformat(r.json()["deadline"])
+
+        # 越过旧截止点后等待者仍应挂着（没被误唤醒成 expired）
+        await asyncio.sleep(1.1)
+        assert not waiter.done(), "等待者按旧截止时间误报 expired"
+
+        elapsed, wr = await waiter
+        assert wr.status_code == 200
+        body = wr.json()
+        assert body["status"] == "expired"
+        assert body["missing"] == ["a", "b"]
+        # 返回时刻不应早于新截止时间（容差）
+        assert elapsed > 3.0, f"等待者在新截止前返回: {elapsed:.2f}s"
+        assert abs((time.time() - new_deadline_abs.timestamp())) < 2.0
+
+
+@pytest.mark.asyncio
+async def test_extend_with_waiters_then_reach_wakes_all():
+    """延期后继续等待：随后达标仍通过 Pub/Sub 唤醒全部等待者，终态唯一。"""
+    async with await _client() as c:
+        b = await create_barrier(c, ["w1", "w2", "w3"], threshold=2, ttl_s=2)
+        bid = b["barrier_id"]
+
+        async def wait_view():
+            async with await _client() as c2:
+                r = await c2.get(f"/barriers/{bid}/wait")
+                return r
+
+        waiters = [asyncio.create_task(wait_view()) for _ in range(3)]
+        await asyncio.sleep(0.3)
+        r = await extend(
+            c, bid, datetime.now(timezone.utc) + timedelta(seconds=30)
+        )
+        assert r.status_code == 200
+        await asyncio.sleep(0.2)
+        await checkin(c, bid, "w1")
+        await asyncio.sleep(0.1)
+        await checkin(c, bid, "w2")  # 达标
+
+        outcomes = await asyncio.gather(*waiters)
+        for r in outcomes:
+            assert r.status_code == 200
+            body = r.json()
+            assert body["status"] == "reached"
+            assert sorted(body["quorum"]) == ["w1", "w2"]
+
+
+@pytest.mark.asyncio
+async def test_extend_races_with_cancel_and_reach():
+    """延期与取消 / 达标报到的 Lua 脚本放入同一事务交替入队：先执行者决定唯一
+    结果——终态先发生则延期 409 且终态不变；延期先发生则屏障继续 waiting，
+    终态脚本按当时状态执行，任何情况下终态都不可被延期复活。"""
+    from app.barrier_store import (
+        CANCEL_SCRIPT,
+        CHECKIN_SCRIPT,
+        EXTEND_SCRIPT,
+    )
+    from app.main import app
+
+    async with await _client() as c:
+        r = app.state.store.redis
+        outcomes = []
+
+        for i in range(30):
+            b = await create_barrier(c, ["a", "b"], threshold=1, ttl_s=10)
+            bid = b["barrier_id"]
+            keys = [
+                f"barrier:{bid}",
+                f"barrier:{bid}:roster",
+                f"barrier:{bid}:checked",
+                f"barrier:{bid}:frozen",
+                f"barrier:{bid}:events",
+                f"barrier:{bid}:cancel",
+                f"barrier:{bid}:gmap",
+                f"barrier:{bid}:gcheck",
+            ]
+            now = f"{time.time():.3f}"
+            later = f"{time.time() + 120:.3f}"
+            pipe = r.pipeline(transaction=True)
+            if i % 2 == 0:
+                pipe.eval(EXTEND_SCRIPT, 8, *keys, later, now, str(24 * 3600 * 1000))
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+                ext_raw, chk_raw = await pipe.execute()
+            else:
+                pipe.eval(CHECKIN_SCRIPT, 8, *keys, "a", now)
+                pipe.eval(EXTEND_SCRIPT, 8, *keys, later, now, str(24 * 3600 * 1000))
+                chk_raw, ext_raw = await pipe.execute()
+            g = (await c.get(f"/barriers/{bid}")).json()
+            assert g["status"] == "reached"
+            # 达标是终态：延期无论先后顺序都不可能在达标后生效
+            if i % 2 == 0:
+                assert ext_raw[0] == "extended"  # 先延期成功
+                assert chk_raw[0] == "reached"
+            else:
+                assert chk_raw[0] == "reached"  # 先达标
+                assert ext_raw[0] == "reached"  # 终态拒绝延期
+            # 达标后再延期依旧 409
+            assert (
+                await extend(
+                    c, bid, datetime.now(timezone.utc) + timedelta(seconds=300)
+                )
+            ).status_code == 409
+            outcomes.append(g["status"])
+
+        assert set(outcomes) == {"reached"}
+
+        # 延期 vs 取消交替：先取消则延期 409；先延期则取消成功，
+        # 视图终态必须与脚本返回完全一致。
+        seen = []
+        for i in range(30):
+            b = await create_barrier(c, ["a", "b"], threshold=2, ttl_s=10)
+            bid = b["barrier_id"]
+            keys = [
+                f"barrier:{bid}",
+                f"barrier:{bid}:roster",
+                f"barrier:{bid}:checked",
+                f"barrier:{bid}:frozen",
+                f"barrier:{bid}:events",
+                f"barrier:{bid}:cancel",
+                f"barrier:{bid}:gmap",
+                f"barrier:{bid}:gcheck",
+            ]
+            now = f"{time.time():.3f}"
+            later = f"{time.time() + 120:.3f}"
+            pipe = r.pipeline(transaction=True)
+            if i % 2 == 0:
+                pipe.eval(EXTEND_SCRIPT, 8, *keys, later, now, str(24 * 3600 * 1000))
+                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+                ext_raw, cancel_raw = await pipe.execute()
+            else:
+                pipe.eval(CANCEL_SCRIPT, 8, *keys, "race", now)
+                pipe.eval(EXTEND_SCRIPT, 8, *keys, later, now, str(24 * 3600 * 1000))
+                cancel_raw, ext_raw = await pipe.execute()
+
+            g = (await c.get(f"/barriers/{bid}")).json()
+            assert g["status"] == "cancelled"
+            assert ext_raw[0] == ("extended" if i % 2 == 0 else "cancelled")
+            assert cancel_raw[0] == "cancelled"
+            seen.append(g["status"])
+        assert set(seen) == {"cancelled"}
+
+
+@pytest.mark.asyncio
+async def test_extend_refreshes_ttl_on_all_keys():
+    """延期成功后所有屏障键的存活期都按新 deadline 重算：远大于旧 TTL 剩余，
+    且各键之间保持同生共死（同一 PEXPIRE 原子批次）。"""
+    from app.main import app
+
+    async with await _client() as c:
+        b = await create_barrier(c, ["a", "b", "c"], threshold=3, ttl_s=2)
+        bid = b["barrier_id"]
+        await checkin(c, bid, "a")
+
+        r = await extend(
+            c, bid, datetime.now(timezone.utc) + timedelta(seconds=60)
+        )
+        assert r.status_code == 200
+
+        redis = app.state.store.redis
+        key_names = [
+            "",
+            ":roster",
+            ":checked",
+            ":events",
+        ]
+        ttls = []
+        for suffix in key_names:
+            ttls.append(await redis.pttl(f"barrier:{bid}{suffix}"))
+        # 默认缓冲 24h：新 TTL ≈ 60s + 86400s；旧剩余只有 ~2s
+        for ttl in ttls:
+            assert ttl > 60_000, ttl
+        # 同一批次刷新，差值应远小于一次完整延期耗时
+        assert max(ttls) - min(ttls) < 2000, ttls
 
 
 # ---------------------------------------------------------------------------

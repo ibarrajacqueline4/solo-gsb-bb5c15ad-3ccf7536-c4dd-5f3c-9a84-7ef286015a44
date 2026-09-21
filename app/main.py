@@ -1,12 +1,13 @@
 """并行任务协调收尾屏障 API。
 
 路由：
-  POST   /barriers                   创建屏障（参与者名单、达标人数、截止时间）
-  GET    /barriers/{bid}             查询当前状态（不阻塞）
-  POST   /barriers/{bid}/checkin     参与者幂等报到
-  POST   /barriers/{bid}/cancel      主动取消（与达标报到原子竞争，先发生者为唯一终态）
-  GET    /barriers/{bid}/wait        阻塞等待达标 / 取消 / 截止
-  GET    /barriers/{bid}/events      报到审计事件（cursor/limit 分页）
+  POST   /barriers                           创建屏障（参与者名单、达标人数、截止时间）
+  GET    /barriers/{bid}                     查询当前状态（不阻塞）
+  POST   /barriers/{bid}/checkin             参与者幂等报到
+  POST   /barriers/{bid}/cancel              主动取消（与达标报到原子竞争，先发生者为唯一终态）
+  PATCH  /barriers/{bid}/deadline            运行中延期（仅 waiting 且新时间更晚，原子更新并唤醒等待者）
+  GET    /barriers/{bid}/wait                阻塞等待达标 / 取消 / 截止
+  GET    /barriers/{bid}/events              报到审计事件（cursor/limit 分页）
 
 交互文档：GET /docs（Swagger UI）
 """
@@ -23,6 +24,7 @@ from redis.exceptions import RedisError
 
 from .barrier_store import (
     BarrierCancelled,
+    BarrierDeadlineConflict,
     BarrierExpired,
     BarrierNotFound,
     BarrierReached,
@@ -39,6 +41,7 @@ from .models import (
     CheckinRequest,
     CheckinResponse,
     CreateBarrierRequest,
+    ExtendDeadlineRequest,
 )
 from .service import _dt, build_view, wait_for_settle
 
@@ -55,8 +58,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="任务收尾屏障 API",
-    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止。",
-    version="1.2.0",
+    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消、截止或运行中延期。",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -83,6 +86,7 @@ async def root() -> dict[str, object]:
             "get": "GET /barriers/{barrier_id}",
             "checkin": "POST /barriers/{barrier_id}/checkin",
             "cancel": "POST /barriers/{barrier_id}/cancel",
+            "extend_deadline": "PATCH /barriers/{barrier_id}/deadline",
             "wait": "GET /barriers/{barrier_id}/wait",
             "events": "GET /barriers/{barrier_id}/events",
         },
@@ -223,6 +227,72 @@ async def cancel_barrier(
         cancelled_at=_dt(result.cancelled_at),
         view=view,
     )
+
+
+@app.patch(
+    "/barriers/{barrier_id}/deadline",
+    response_model=BarrierView,
+    tags=["barriers"],
+)
+async def extend_deadline(
+    barrier_id: str, payload: ExtendDeadlineRequest, request: Request
+) -> BarrierView:
+    """运行中延期：把截止时间更新为更晚的绝对时间。
+
+    - 仅允许屏障仍处于 waiting；reached / cancelled / expired 均为终态，
+      返回 409，绝不复活，任何终态数据都不被触碰；
+    - 新截止时间必须**严格晚于**当前生效的 deadline，相同或更早返回 409；
+    - 状态校验、新旧时间比较、deadline 写入与全部相关键 TTL 刷新在同一
+      Redis Lua 脚本内原子完成；
+    - 多个并发延期以 Redis 实际生效顺序为准：每个请求只与当时的生效值比较，
+      较早或相同的请求返回 409；
+    - 延期成功后发布 ``deadline_extended`` 通知，已挂起的 /wait 立即重读最新
+      deadline 继续等待，不会按旧截止时间误报 expired；
+    - 成功时返回更新后的完整 BarrierView（status 仍为 waiting）。
+    """
+    meta = await _load_meta(request, barrier_id)
+    svc = store(request)
+    new_deadline = payload.deadline_ts()
+
+    # 快速失败：请求时间不晚于当前已知截止时间直接拒绝；权威比较仍以 Lua 内
+    # 读到的 Redis 当前值为准（并发延期下这里可能已过期）。
+    if new_deadline <= meta.deadline:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"新截止时间必须晚于当前截止时间 "
+                f"{_dt(meta.deadline).isoformat()}"
+            ),
+        )
+
+    try:
+        await svc.extend_deadline(
+            barrier_id, new_deadline, settings.ttl_buffer_ms
+        )
+    except BarrierDeadlineConflict as exc:
+        if exc.reason == "conflict":
+            current = (
+                _dt(exc.current_deadline).isoformat()
+                if exc.current_deadline is not None
+                else "未知"
+            )
+            raise HTTPException(
+                status_code=409,
+                detail=f"新截止时间必须晚于当前截止时间 {current}",
+            )
+        if exc.reason == "reached":
+            raise HTTPException(status_code=409, detail="屏障已达标，终态不可延期")
+        if exc.reason == "cancelled":
+            raise HTTPException(status_code=409, detail="屏障已被取消，终态不可延期")
+        raise HTTPException(
+            status_code=409, detail="屏障已过截止时间，终态不可延期复活"
+        )
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    # 重读元数据后组装完整视图：deadline / TTL 已由 Lua 原子更新。
+    latest = await _load_meta(request, barrier_id)
+    return await build_view(svc, latest)
 
 
 @app.get("/barriers/{barrier_id}/wait", response_model=BarrierView, tags=["barriers"])

@@ -14,9 +14,12 @@
 
 ``frozen`` 与 ``cancel`` 互斥：达标报到与主动取消由各自的 Lua 脚本原子竞争，
 Redis 单线程串行执行脚本，先发生者成为唯一终态，任何路径都不得改写。
+运行中延期（deadline 延长）由第三段 Lua 脚本与前两者同样地原子竞争：
+终态键（frozen/cancel）或已过截止的屏障一律拒绝延期，绝不复活终态。
 
 频道 ``barrier:{bid}:events`` 在达标冻结后发布 ``reached`` 消息、
-在主动取消后发布 ``cancelled`` 消息。
+在主动取消后发布 ``cancelled`` 消息、在成功延期后发布 ``deadline_extended``
+消息（通知挂起中的 /wait 回读最新 deadline 继续等待）。
 """
 
 from __future__ import annotations
@@ -226,6 +229,79 @@ return {'cancelled', reason, now_str}
 """
 
 
+# 运行中延期脚本。返回数组：
+#   {'unknown'}                                        屏障不存在
+#   {'reached'}                                        已达标，终态不可延期
+#   {'cancelled'}                                      已取消，终态不可延期
+#   {'expired'}                                        已过截止时间，不可延期/复活
+#   {'conflict', old_deadline}                         新截止时间不晚于当前值，
+#                                                      含并发延期已先写入更大值
+#   {'extended', old_deadline, new_deadline, ttl_ms}   本次延期成功
+#
+# 与报到 / 取消脚本一样在 Redis 单线程内原子执行：frozen/cancel 存在性检查、
+# 截止检查、deadline 大小比较与写入之间不可能插入任何其他脚本，因此延期与
+# 并发报到、取消、延期之间只有唯一一致结果。成功时在同一脚本内将新的
+# deadline 写回 meta，并重算 ttl_ms、刷新所有相关键的存活期：新 ttl 锚定
+# 「当前时刻 + (新 deadline - now) + 缓冲」，保证任何键都不会在新 deadline
+# 之前被回收，且与报到脚本 refresh_ttl 的再锚定语义保持一致。
+EXTEND_SCRIPT = """
+local meta_key    = KEYS[1]
+local roster_key  = KEYS[2]
+local checked_key = KEYS[3]
+local frozen_key  = KEYS[4]
+local events_key  = KEYS[5]
+local cancel_key  = KEYS[6]
+local gmap_key    = KEYS[7]
+local gcheck_key  = KEYS[8]
+local new_deadline = tonumber(ARGV[1])
+local now          = tonumber(ARGV[2])
+local buffer_ms    = tonumber(ARGV[3])
+
+if redis.call('HEXISTS', meta_key, 'threshold') == 0 then
+    return {'unknown'}
+end
+
+-- 终态一：达标冻结快照已存在，延期不得触碰任何终态。
+if redis.call('HEXISTS', frozen_key, 'quorum') == 1 then
+    return {'reached'}
+end
+
+-- 终态二：取消快照已存在，终态不可复活。
+if redis.call('HEXISTS', cancel_key, 'cancelled_at') == 1 then
+    return {'cancelled'}
+end
+
+local deadline = tonumber(redis.call('HGET', meta_key, 'deadline'))
+
+-- 终态三：已过当前截止时间（expired 不落键，靠时间判定），同样不得复活。
+if now >= deadline then
+    return {'expired'}
+end
+
+-- 只允许向后延期；相等或更早一律冲突。并发延期时 Redis 串行执行：
+-- 先写入更大 deadline 的请求成功，其余请求读到的已是更新后的 deadline。
+if new_deadline <= deadline then
+    return {'conflict', tostring(deadline)}
+end
+
+-- 重算存活期：保证新 deadline + buffer 之前所有键都存活。ttl_ms 同步写回
+-- meta，使报到脚本之后的 refresh_ttl 也锚定到同一条绝对过期时间线。
+local ttl_ms = math.max(0, math.ceil((new_deadline - now) * 1000)) + buffer_ms
+redis.call('HSET', meta_key, 'deadline', tostring(new_deadline), 'ttl_ms', ttl_ms)
+
+redis.call('PEXPIRE', meta_key, ttl_ms)
+redis.call('PEXPIRE', roster_key, ttl_ms)
+redis.call('PEXPIRE', checked_key, ttl_ms)
+redis.call('PEXPIRE', frozen_key, ttl_ms)
+redis.call('PEXPIRE', events_key, ttl_ms)
+redis.call('PEXPIRE', cancel_key, ttl_ms)
+redis.call('PEXPIRE', gmap_key, ttl_ms)
+redis.call('PEXPIRE', gcheck_key, ttl_ms)
+
+return {'extended', tostring(deadline), tostring(new_deadline), tostring(ttl_ms)}
+"""
+
+
 class BarrierNotFound(Exception):
     """屏障不存在或已过期清理。"""
 
@@ -244,6 +320,10 @@ class BarrierReached(Exception):
 
 class BarrierCancelled(Exception):
     """屏障已被主动取消，后续报到被拒绝。"""
+
+
+class BarrierDeadlineConflict(Exception):
+    """延期被拒绝：屏障已进入终态，或新截止时间不晚于当前截止时间。"""
 
 
 @dataclass(frozen=True)
@@ -294,11 +374,19 @@ class CancelResult:
         return self.status == "already_cancelled"
 
 
+@dataclass(frozen=True)
+class ExtendResult:
+    old_deadline: float  # 延期前的截止时间（Unix 秒）
+    new_deadline: float  # 本次写入的截止时间（Unix 秒）
+    ttl_ms: int
+
+
 class BarrierStore:
     def __init__(self, redis: Redis) -> None:
         self.redis = redis
         self._checkin = redis.register_script(CHECKIN_SCRIPT)
         self._cancel = redis.register_script(CANCEL_SCRIPT)
+        self._extend = redis.register_script(EXTEND_SCRIPT)
 
     @staticmethod
     def channel(barrier_id: str) -> str:
@@ -461,6 +549,48 @@ class BarrierStore:
         if status == "cancelled":
             await self.redis.publish(self.channel(barrier_id), "cancelled")
 
+        return result
+
+    async def extend_deadline(
+        self,
+        barrier_id: str,
+        new_deadline_ts: float,
+        ttl_buffer_ms: int,
+        now: float | None = None,
+    ) -> ExtendResult:
+        """运行中延期：原子校验终态与时间先后，原子更新 deadline 与全部键 TTL。
+
+        只允许 waiting 且新截止时间严格晚于当前 deadline 的请求成功；
+        reached / cancelled / expired 与「不晚于当前值」（含并发延期已抢先
+        写入更大值）均抛出 :class:`BarrierDeadlineConflict`；屏障不存在则
+        抛出 :class:`BarrierNotFound`。成功后发布 ``deadline_extended``，
+        唤醒 /wait 等待者回读最新 deadline，终态绝不会被复活。
+        """
+        keys = self._keys(barrier_id)
+        raw = await self._extend(
+            keys=list(keys),
+            args=[
+                f"{new_deadline_ts:.3f}",
+                f"{(now if now is not None else time.time()):.3f}",
+                int(ttl_buffer_ms),
+            ],
+        )
+        status = raw[0]
+
+        if status == "unknown":
+            raise BarrierNotFound(barrier_id)
+        if status in ("reached", "cancelled", "expired", "conflict"):
+            raise BarrierDeadlineConflict(status)
+
+        result = ExtendResult(
+            old_deadline=float(raw[1]),
+            new_deadline=float(raw[2]),
+            ttl_ms=int(raw[3]),
+        )
+
+        # 仅真正完成延期时广播；等待者收到后回读 meta 中的新 deadline。
+        # 发布丢失也无碍：等待者的轮询兜底同样会回读最新 deadline。
+        await self.redis.publish(self.channel(barrier_id), "deadline_extended")
         return result
 
     async def get_frozen(self, barrier_id: str) -> dict[str, Any] | None:

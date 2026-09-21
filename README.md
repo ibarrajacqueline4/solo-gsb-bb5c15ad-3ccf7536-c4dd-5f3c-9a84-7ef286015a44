@@ -7,6 +7,7 @@
 - 参与者以自己的标识**幂等报到**；
 - 并发报到中**首次同时满足总人数与各组配额的瞬间，达标成员与分组计数在 Redis 内被原子冻结**为快照，之后的任何报到（哪怕来自其他名单成员）都不会改写 `quorum` / `frozen_at` / `group_progress`；跨组并发报到也**只有一个请求** `triggered=true`；
 - 支持**主动取消**：取消与达标报到在 Redis 中**原子竞争**，先发生者成为唯一终态（`cancelled` 与 `reached` 互斥）；取消保存 `reason` / `cancelled_at` 并唤醒全部等待者；
+- 支持**运行中延期**：`PATCH /barriers/{id}/deadline` 传入新的**绝对截止时间**，仅当屏障仍处于 `waiting` 且新时间**严格晚于**当前 deadline 时，在一段 Redis Lua 脚本内原子完成状态校验、deadline 写回与**全部相关键存活期刷新**；终态（reached/cancelled/expired）绝不复活；并发延期、报到与取消保持唯一一致结果；延期成功立即通知已挂起的 `/wait` **按最新 deadline 继续等待**，不会按旧截止时间误报 `expired`；
 - 提供**阻塞等待接口**：达标 / 取消时立即返回终态快照；截止时返回已报到成员与缺席名单；多个等待者通过 Redis Pub/Sub 一并被可靠唤醒（轮询兜底，消息丢失也不会睡死）。
 
 ## 一条命令启动（含 Redis）
@@ -165,7 +166,59 @@ curl -s -X POST http://localhost:8000/barriers/<id>/cancel \
 - 取消时已有的报到名单作为快照保留在 `checked_in` 中；取消本身不是报到行为，不产生报到审计事件。
 - 屏障不存在/已回收 → `404`。
 
-### 4. 阻塞等待 `GET /barriers/{barrier_id}/wait`
+### 4. 运行中延期 `PATCH /barriers/{barrier_id}/deadline`
+
+请求体传入新的**绝对截止时间**（ISO-8601，不带时区按 UTC 处理）。只有屏障仍处于 `waiting` 且新时间**严格晚于当前 deadline** 时才生效；成功后返回更新后的完整 `BarrierView`（200）：
+
+```bash
+curl -s -X PATCH http://localhost:8000/barriers/<id>/deadline \
+  -H 'Content-Type: application/json' \
+  -d '{"deadline":"2026-09-21T16:30:00Z"}'
+```
+
+返回（`200`，节选）：
+
+```json
+{
+  "barrier_id": "8f3c…",
+  "status": "waiting",
+  "threshold": 2,
+  "deadline": "2026-09-21T16:30:00Z",
+  "checked_in": ["node-a"],
+  "checked_count": 1
+}
+```
+
+冲突与状态语义：
+
+- 新 deadline **早于或等于**当前 deadline → `409`（`新 deadline 必须严格晚于当前 deadline`）；
+- 屏障已 `reached` / `cancelled` / `expired` → 一律 `409`，文案分别标明达标 / 取消 / 已截止，**终态绝不因延期复活**，快照、缺席名单、取消原因均保持不变；
+- 请求体里的时间本身已是过去时间 → `422`；屏障不存在/已回收 → `404`；
+- 延期只改 deadline 与键存活期，**不是报到行为**，不产生报到审计事件，也不改变任何报到/分组计数。
+
+**并发语义（以 Redis 实际生效顺序为准）**：终态校验（frozen / cancel / 是否已过当前 deadline）、新旧 deadline 比较、deadline 写回与**全部 8 个相关键**（meta、roster、checked、frozen、events、cancel、gmap、gcheck）的 `PEXPIRE` 存活期刷新在**同一段 Lua 脚本**内原子完成。因此：
+
+- 多个延期请求并发：Redis 单线程串行执行，按实际生效顺序逐个比较；每次都比执行瞬间的当前值更晚的请求成功，**较早或相同的请求返回 `409`**，最终 deadline 唯一确定为最大生效值；
+- 延期与达标报到 / 取消并发：与既有三段（报到、取消、延期）脚本互相串行，先提交者决定唯一结果——若报到先达标或取消先生效，延期返回 `409`；若延期先生效，后续报到按**新 deadline** 判定，取消仍可正常进行；
+- 成功延期后，全部键的回收时间按新 deadline 顺延（`新 deadline − now + BARRIER_TTL_BUFFER_MS`），不会在新截止时间之前被 Redis 提前回收。
+
+**对 `/wait` 的影响**：延期成功后向频道 `barrier:{id}:events` 发布 `deadline_extended`，所有已在 `/wait` 挂起的等待者被立即唤醒并**回读最新 deadline** 后继续等待——即使旧截止时间已过，也不会误报 `expired`；等待者最终在新的截止时间返回 `expired`，或在那之前达标 / 被取消时立即返回终态。发布丢失时轮询兜底同样会回读最新 deadline。
+
+可连续多次延期，每次都必须严格晚于上一次生效后的值：
+
+```bash
+# 第一次成功
+curl -s -X PATCH http://localhost:8000/barriers/<id>/deadline \
+  -H 'Content-Type: application/json' -d '{"deadline":"2026-09-21T16:30:00Z"}'
+# 相同或更早 -> 409
+curl -s -X PATCH http://localhost:8000/barriers/<id>/deadline \
+  -H 'Content-Type: application/json' -d '{"deadline":"2026-09-21T16:30:00Z"}'
+# 更晚 -> 200
+curl -s -X PATCH http://localhost:8000/barriers/<id>/deadline \
+  -H 'Content-Type: application/json' -d '{"deadline":"2026-09-21T17:00:00Z"}'
+```
+
+### 5. 阻塞等待 `GET /barriers/{barrier_id}/wait`
 
 ```bash
 curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取消或截止
@@ -174,9 +227,9 @@ curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取
 - 达标时立即返回 `status: "reached"`、冻结的 `quorum` 与 `frozen_at`；
 - 取消时立即返回 `status: "cancelled"`、`cancel_reason` 与 `cancelled_at`；
 - 截止时返回 `status: "expired"`、`checked_in` 已报到名单与 `missing` 缺席名单；
-- 任意数量的等待者并发挂起：达标 / 取消各发布一条 Pub/Sub 消息全部唤醒；订阅采用“先订阅后复查 + 轮询兜底”，消息丢失或错过发布也不会漏唤醒（截止不发布消息，由轮询在截止点自然到期兜底）。
+- 任意数量的等待者并发挂起：达标 / 取消 / 延期各发布一条 Pub/Sub 消息全部唤醒；订阅采用“先订阅后复查 + 轮询兜底”，消息丢失或错过发布也不会漏唤醒（自然截止不发布消息，由轮询在截止点到期兜底）。等待期间 deadline 被延期时，等待者以回读到的**最新 deadline** 为准继续等待，绝不在旧截止点误报 `expired`。
 
-### 5. 非阻塞查询 `GET /barriers/{barrier_id}`
+### 6. 非阻塞查询 `GET /barriers/{barrier_id}`
 
 随时查看当前 `waiting / reached / expired / cancelled` 状态、报到人数、冻结快照、缺席与迟到名单、取消原因与时间。
 
@@ -197,7 +250,7 @@ curl -s http://localhost:8000/barriers/<id>/wait   # 挂起，直到达标、取
 
 上例中总人数已达 `threshold`，但 `dc3` 配额未满足，屏障仍为 `waiting`。`reached` 后该数组是**冻结快照**（与 `quorum` 同生共死），迟到报到不会推进任何计数；`expired` / `cancelled` 下如实反映终态发生时的进度。未启用分组配额的屏障不返回该字段。
 
-### 6. 报到审计事件 `GET /barriers/{barrier_id}/events`
+### 7. 报到审计事件 `GET /barriers/{barrier_id}/events`
 
 ```bash
 curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
@@ -226,11 +279,12 @@ curl -s 'http://localhost:8000/barriers/<id>/events?cursor=0&limit=100'
 ## 并发与一致性保证
 
 - 报到判定由一段 Lua 脚本完成：`名单校验 → 终态校验（frozen/cancel/截止）→ 去重 SADD（新成员才同步 HINCRBY 对应分组计数）→ 人数与分组配额判定 → 写入冻结快照（quorum + 分组计数）` 整体原子执行；取消由另一段 Lua 脚本完成：`终态校验（cancel/frozen/截止）→ 写入取消快照` 整体原子执行。Redis 单线程串行执行脚本，因此达标与取消**必有且仅有一个赢家**：并发报到（包括不同分组的成员同时补齐各自短板）只有一个请求得到 `reached`，或者取消请求得到 `cancelled`，互斥终态的成员集合、时间点、分组计数、取消原因均唯一确定。
+- 运行中延期由第三段 Lua 脚本完成：`终态校验（frozen/cancel/当前截止）→ 新旧 deadline 严格比较 → 写回 deadline 与重算 ttl_ms → 对全部 8 个键 PEXPIRE` 整体原子执行。它与报到、取消脚本在同一 Redis 上串行竞争：终态已落地（reached / cancelled / expired）时延期返回 `409` 且不复活终态；并发延期以 Redis 实际生效顺序为准，只有新时间严格晚于执行瞬间当前值的请求成功，相同或更早的请求返回 `409`，最终 deadline 唯一确定。延期不触碰 checked / gcheck / frozen / cancel 的任何业务数据，仅更新 meta 中的 deadline 与各键存活期。
 - 总数与分组计数都只统计**去重后的唯一报到**：重复报到（`already_checked_in`）与达标后的迟到报到（`late`）均不执行 `HINCRBY`，分组计数不重复累计；达标冻结之后连 `gcheck` 计数也一并冻结。
 - 报到审计事件在同一 Lua 脚本内追加（`RPUSH` 到 `events` 列表，序号 = 列表长度 + 1），与状态变更同生共死：要么一起成功，要么都不发生；脚本串行执行保证 `seq` 从 1 连续递增、无空洞无重复。
-- 终态落地后脚本的所有写路径都不会触碰对方的终态键：迟到报到只追加到 `checked` 集合（反映在 `late` 字段）；取消后的报到不写任何键；已达标 / 已截止后的取消直接返回冲突。
-- 报到响应里的 `PUBLISH reached` 与取消响应里的 `PUBLISH cancelled` 都在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态。
-- 截止不发布消息（无后台扫描进程），等待者在剩余截止时间上自然到期回读，避免引入额外调度组件。
+- 终态落地后脚本的所有写路径都不会触碰对方的终态键：迟到报到只追加到 `checked` 集合（反映在 `late` 字段）；取消后的报到不写任何键；已达标 / 已截止后的取消直接返回冲突；已达标 / 已取消 / 已截止后的延期直接返回冲突。
+- 报到响应里的 `PUBLISH reached`、取消响应里的 `PUBLISH cancelled` 与延期响应里的 `PUBLISH deadline_extended` 都在脚本执行成功之后进行；即使发布失败，等待者每 `BARRIER_POLL_INTERVAL_S` 秒回读一次真实状态（含 meta 中可能已被延期的最新 deadline）。
+- 自然截止不发布消息（无后台扫描进程），等待者在剩余截止时间上自然到期回读；该剩余时间每轮都按回读到的最新 deadline 重算，因此延期后旧截止点不会产生误报，避免引入额外调度组件。
 
 ## 本地不使用容器开发
 
@@ -247,8 +301,8 @@ REDIS_URL=redis://localhost:6379/0 uvicorn app.main:app --reload --port 8000
 ```
 app/
   main.py           FastAPI 路由与错误映射
-  barrier_store.py  Redis 键模型 + 原子报到/取消 Lua 脚本（分组配额计数、审计事件）+ Pub/Sub
-  service.py        状态机视图组装、阻塞等待
+  barrier_store.py  Redis 键模型 + 原子报到/取消/延期 Lua 脚本（分组配额计数、审计事件、TTL 顺延）+ Pub/Sub
+  service.py        状态机视图组装、阻塞等待（按最新 deadline 回读）
   models.py         请求/响应模型与校验
   config.py         环境变量配置
 Dockerfile          API 镜像

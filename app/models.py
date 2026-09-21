@@ -124,6 +124,22 @@ class CreateBarrierRequest(BaseModel):
         return d.astimezone(timezone.utc).timestamp()
 
 
+class ExtendDeadlineRequest(BaseModel):
+    deadline: datetime = Field(
+        ...,
+        description=(
+            "新的绝对截止时间，ISO-8601；不带时区偏移时按 UTC 处理。"
+            "必须严格晚于屏障当前 deadline，否则返回 409"
+        ),
+    )
+
+    def deadline_ts(self) -> float:
+        d = self.deadline
+        if d.tzinfo is None:
+            d = d.replace(tzinfo=timezone.utc)
+        return d.astimezone(timezone.utc).timestamp()
+
+
 class GroupProgress(BaseModel):
     group: str = Field(description="分组名")
     threshold: int = Field(description="该组达标配额")

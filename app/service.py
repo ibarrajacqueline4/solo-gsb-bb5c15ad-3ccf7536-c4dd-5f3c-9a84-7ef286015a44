@@ -145,9 +145,17 @@ async def wait_for_settle(
 
     主通道为 Pub/Sub：先订阅，再检查一次状态（消除“先检查后订阅”的丢消息窗口）；
     轮询作为兜底，覆盖发布丢失 / 截止时间到达（截止不发布消息）两种情况。
-    多个等待者各自订阅同一频道，达标（reached）或取消（cancelled）发布时全部被唤醒。
+    多个等待者各自订阅同一频道，达标（reached）、取消（cancelled）或运行中
+    延期（deadline_extended）发布时全部被唤醒。
+
+    每次被唤醒（以及每轮轮询）都重新读取 meta 再组装视图：延期只改 meta 中的
+    deadline，等待者必须以最新 deadline 继续等待，绝不能按进入请求时的旧
+    deadline 误报 expired。
     """
-    deadline_d = meta.deadline
+    def _current_meta(latest: BarrierMeta | None) -> BarrierMeta:
+        # 极端情况下 meta 恰好在 TTL 点被回收：沿用最后一份已知 meta，
+        # 由 build_view 依据终态键/时间给出结果，而不是抛错中断等待。
+        return latest if latest is not None else meta
 
     # 已经有结果则立即返回（达标、取消快照或截止结果）
     first = await build_view(store, meta)
@@ -157,8 +165,9 @@ async def wait_for_settle(
     pubsub = store.redis.pubsub()
     await pubsub.subscribe(store.channel(meta.barrier_id))
     try:
-        # 订阅成功后再次检查：终态发布可能发生在第一次检查与订阅之间
-        second = await build_view(store, meta)
+        # 订阅成功后再次检查：终态/延期发布可能发生在第一次检查与订阅之间
+        latest = await store.get_meta(meta.barrier_id)
+        second = await build_view(store, _current_meta(latest))
         if second.status in SETTLED_STATUSES:
             return second
 
@@ -167,8 +176,11 @@ async def wait_for_settle(
             now = time.time()
             remaining_budget = max_wait_s - (now - start)
             if remaining_budget <= 0:
-                return await build_view(store, meta, now)
+                latest = await store.get_meta(meta.barrier_id)
+                return await build_view(store, _current_meta(latest), now)
 
+            # 用最新截止时间计算本轮等待时长（延期后自动顺延）。
+            deadline_d = _current_meta(latest).deadline
             # get_message 阻塞至多 timeout；Pub/Sub 消息与轮询共用这一等待
             timeout = min(
                 poll_interval_s,
@@ -180,9 +192,11 @@ async def wait_for_settle(
                     ignore_subscribe_messages=True, timeout=timeout
                 )
 
-            # 无论被消息唤醒还是轮询到期，都回读真实状态：
-            # 达标 / 取消则立即返回终态快照；到达截止则返回报到与缺席名单。
-            view = await build_view(store, meta)
+            # 无论被哪条消息唤醒还是轮询到期，都先回写最新 meta（deadline 可能
+            # 已被 PATCH 延期更新），再回读真实状态：达标 / 取消立即返回终态
+            # 快照；到达最新截止才返回 expired；仍是 waiting 则继续等待。
+            latest = await store.get_meta(meta.barrier_id)
+            view = await build_view(store, _current_meta(latest))
             if view.status in SETTLED_STATUSES:
                 return view
     finally:

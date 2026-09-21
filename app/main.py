@@ -1,12 +1,13 @@
 """并行任务协调收尾屏障 API。
 
 路由：
-  POST   /barriers                   创建屏障（参与者名单、达标人数、截止时间）
-  GET    /barriers/{bid}             查询当前状态（不阻塞）
-  POST   /barriers/{bid}/checkin     参与者幂等报到
-  POST   /barriers/{bid}/cancel      主动取消（与达标报到原子竞争，先发生者为唯一终态）
-  GET    /barriers/{bid}/wait        阻塞等待达标 / 取消 / 截止
-  GET    /barriers/{bid}/events      报到审计事件（cursor/limit 分页）
+  POST   /barriers                          创建屏障（参与者名单、达标人数、截止时间）
+  GET    /barriers/{bid}                    查询当前状态（不阻塞）
+  POST   /barriers/{bid}/checkin            参与者幂等报到
+  POST   /barriers/{bid}/cancel             主动取消（与达标报到原子竞争，先发生者为唯一终态）
+  PATCH  /barriers/{bid}/deadline           运行中延期（仅 waiting 且新时间更晚时原子生效）
+  GET    /barriers/{bid}/wait               阻塞等待达标 / 取消 / 截止
+  GET    /barriers/{bid}/events             报到审计事件（cursor/limit 分页）
 
 交互文档：GET /docs（Swagger UI）
 """
@@ -23,6 +24,7 @@ from redis.exceptions import RedisError
 
 from .barrier_store import (
     BarrierCancelled,
+    BarrierDeadlineConflict,
     BarrierExpired,
     BarrierNotFound,
     BarrierReached,
@@ -39,6 +41,7 @@ from .models import (
     CheckinRequest,
     CheckinResponse,
     CreateBarrierRequest,
+    ExtendDeadlineRequest,
 )
 from .service import _dt, build_view, wait_for_settle
 
@@ -55,8 +58,8 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="任务收尾屏障 API",
-    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止。",
-    version="1.2.0",
+    description="并行任务协调收尾：创建屏障、幂等报到、阻塞等待达标、取消或截止、运行中延期。",
+    version="1.3.0",
     lifespan=lifespan,
 )
 
@@ -83,6 +86,7 @@ async def root() -> dict[str, object]:
             "get": "GET /barriers/{barrier_id}",
             "checkin": "POST /barriers/{barrier_id}/checkin",
             "cancel": "POST /barriers/{barrier_id}/cancel",
+            "extend": "PATCH /barriers/{barrier_id}/deadline",
             "wait": "GET /barriers/{barrier_id}/wait",
             "events": "GET /barriers/{barrier_id}/events",
         },
@@ -225,12 +229,64 @@ async def cancel_barrier(
     )
 
 
+@app.patch(
+    "/barriers/{barrier_id}/deadline",
+    response_model=BarrierView,
+    tags=["barriers"],
+)
+async def extend_deadline(
+    barrier_id: str, payload: ExtendDeadlineRequest, request: Request
+) -> BarrierView:
+    """运行中延期：把截止时间更新为更晚的绝对时间。
+
+    - 仅当屏障仍处于 waiting 且新截止时间**严格晚于**当前 deadline 时生效；
+    - reached / cancelled / expired 均为终态，延期返回 409，终态绝不复活；
+    - 终态校验、deadline 比较、deadline 写回与全部相关键 TTL 刷新在同一段
+      Redis Lua 脚本内原子完成，与并发报到、取消、其他延期只有唯一一致结果；
+    - 多个并发延期以 Redis 实际生效顺序为准：先写入更大 deadline 者成功，
+      其余请求（新时间更早或相同，即使只是不晚于被抢先更新后的值）返回 409；
+    - 成功后发布 deadline_extended 通知，已在 /wait 挂起的等待者立即回读
+      最新 deadline 继续等待，不会按旧截止时间误报 expired；
+    - 响应返回更新后的完整 BarrierView。
+    """
+    meta = await _load_meta(request, barrier_id)
+    svc = store(request)
+
+    new_deadline_ts = payload.deadline_ts()
+    if new_deadline_ts <= time.time():
+        raise HTTPException(status_code=422, detail="新 deadline 必须是未来时间")
+
+    try:
+        await svc.extend_deadline(
+            barrier_id,
+            new_deadline_ts=new_deadline_ts,
+            ttl_buffer_ms=settings.ttl_buffer_ms,
+        )
+    except BarrierDeadlineConflict as exc:
+        # Lua 内原子区分冲突原因；终态与“时间不够晚”对外同为 409 但文案不同。
+        reason = exc.args[0] if exc.args else "conflict"
+        detail = {
+            "reached": "屏障已达标，终态不可延期",
+            "cancelled": "屏障已被取消，终态不可延期",
+            "expired": "屏障已过截止时间，延期被拒绝",
+            "conflict": "新 deadline 必须严格晚于当前 deadline",
+        }.get(reason, "延期冲突")
+        raise HTTPException(status_code=409, detail=detail)
+    except BarrierNotFound:
+        raise HTTPException(status_code=404, detail="屏障不存在或已过期回收")
+
+    # 重新读取 meta：deadline / ttl 已在 Lua 内写回，视图必须反映最新值。
+    latest = await svc.get_meta(barrier_id)
+    return await build_view(svc, latest if latest is not None else meta)
+
+
 @app.get("/barriers/{barrier_id}/wait", response_model=BarrierView, tags=["barriers"])
 async def wait_barrier(barrier_id: str, request: Request) -> BarrierView:
     """阻塞等待直到屏障达标、被取消（立即返回终态快照）或截止（返回报到成员与缺席名单）。
 
-    多个等待者同时挂起：达标或取消时通过 Redis Pub/Sub 一并唤醒，轮询为兜底。
-    最长挂起时间受 BARRIER_MAX_WAIT_S 限制。
+    多个等待者同时挂起：达标、取消或运行中延期时通过 Redis Pub/Sub 一并唤醒，
+    轮询为兜底。收到延期通知后回读最新 deadline 继续等待，不会按旧截止时间
+    误报 expired。最长挂起时间受 BARRIER_MAX_WAIT_S 限制。
     """
     meta = await _load_meta(request, barrier_id)
     return await wait_for_settle(

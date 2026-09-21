@@ -1,0 +1,29 @@
+services:
+  redis:
+    image: redis:7-alpine
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    restart: unless-stopped
+
+  api:
+    build: .
+    environment:
+      REDIS_URL: redis://redis:6379/0
+      BARRIER_TTL_BUFFER_MS: "86400000"
+      BARRIER_POLL_INTERVAL_S: "0.5"
+      BARRIER_MAX_WAIT_S: "3600"
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  redis-data:
